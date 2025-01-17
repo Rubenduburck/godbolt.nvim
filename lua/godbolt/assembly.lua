@@ -153,42 +153,73 @@ local function update_source(source_buf)
 	return update_cursor(source_buf, get_current_line())
 end
 local function init_highlight(source_buffer, asm_buffer)
+	if not (api.nvim_buf_is_valid(source_buffer) and api.nvim_buf_is_valid(asm_buffer)) then
+		return nil
+	end
+
 	api.nvim_buf_clear_namespace(asm_buffer, nsid_static, 0, -1)
 	local source_highlights = get_source_highlights(source_buffer, nsid_static)
 	local highlights = get_highlight_groups(get_highlight("static"))
+	if vim.tbl_isempty(highlights) then
+		return nil
+	end
+
 	local entry = map[source_buffer][asm_buffer]
+	if not entry then
+		return nil
+	end
+
+	local source_line_count = api.nvim_buf_line_count(source_buffer)
+	local asm_line_count = api.nvim_buf_line_count(asm_buffer)
+
 	for asm_line, _ in ipairs(entry.asm) do
 		local source_line = get_entry_source_line(entry, asm_line)
-		if source_line then
+		if
+			source_line
+			and source_line > 0
+			and source_line <= source_line_count
+			and asm_line > 0
+			and asm_line <= asm_line_count
+		then
 			local group = cyclic_lookup(highlights, source_line)
-			api.nvim_buf_add_highlight(asm_buffer, nsid_static, group, (asm_line - 1), 0, -1)
+			-- Ensure line numbers are valid before adding highlights
+			pcall(api.nvim_buf_add_highlight, asm_buffer, nsid_static, group, (asm_line - 1), 0, -1)
+
 			if not vim.tbl_contains(source_highlights, (source_line - 1)) then
-				api.nvim_buf_add_highlight(source_buffer, nsid_static, group, (source_line - 1), 0, -1)
+				pcall(api.nvim_buf_add_highlight, source_buffer, nsid_static, group, (source_line - 1), 0, -1)
 				table.insert(source_highlights, (source_line - 1))
-			else
 			end
-		else
 		end
 	end
 	return nil
 end
 local function remove_source(source_buffer)
-	api.nvim_buf_clear_namespace(source_buffer, nsid_static, 0, -1)
-	api.nvim_buf_clear_namespace(source_buffer, nsid, 0, -1)
-	api.nvim_clear_autocmds({ group = "Godbolt", buffer = source_buffer })
+	-- Ensure buffer exists before trying to clear namespaces
+	if api.nvim_buf_is_valid(source_buffer) then
+		api.nvim_buf_clear_namespace(source_buffer, nsid_static, 0, -1)
+		api.nvim_buf_clear_namespace(source_buffer, nsid, 0, -1)
+		api.nvim_clear_autocmds({ group = "Godbolt", buffer = source_buffer })
+	end
+
 	if require("godbolt").config.auto_cleanup and map[source_buffer] then
-		for asm_buffer, _ in pairs(map[source_buffer]) do
-			api.nvim_buf_delete(asm_buffer, {})
+		for asm_buffer, entry in pairs(map[source_buffer]) do
+			if api.nvim_buf_is_valid(asm_buffer) then
+				api.nvim_buf_delete(asm_buffer, {})
+			end
 		end
-	else
 	end
 	map[source_buffer] = nil
 	return nil
 end
 local function remove_asm(source_buffer, asm_buffer)
-	api.nvim_buf_clear_namespace(asm_buffer, nsid_static, 0, -1)
-	api.nvim_buf_clear_namespace(asm_buffer, nsid, 0, -1)
-	map[source_buffer][asm_buffer] = nil
+	if api.nvim_buf_is_valid(asm_buffer) then
+		api.nvim_buf_clear_namespace(asm_buffer, nsid_static, 0, -1)
+		api.nvim_buf_clear_namespace(asm_buffer, nsid, 0, -1)
+	end
+
+	if map[source_buffer] then
+		map[source_buffer][asm_buffer] = nil
+	end
 	return nil
 end
 local function update_asm(source_buffer, asm_buffer)
@@ -197,16 +228,39 @@ local function update_asm(source_buffer, asm_buffer)
 	return update_cursor(source_buffer, source_line)
 end
 local function clear_asm(source_buffer, asm_buffer)
-	remove_asm(source_buffer, asm_buffer)
-	if require("godbolt").config.auto_cleanup and (0 == vim.tbl_count(map[source_buffer])) then
-		return remove_source(source_buffer)
-	else
-		return nil
+	-- Remove the entry from map first before trying any window operations
+	if map[source_buffer] then
+		if map[source_buffer][asm_buffer] then
+			-- Store window id before removing the entry
+			local winid = map[source_buffer][asm_buffer].winid
+			-- Remove the entry
+			map[source_buffer][asm_buffer] = nil
+
+			-- Try to close window if it's still valid
+			if winid and api.nvim_win_is_valid(winid) then
+				pcall(api.nvim_win_close, winid, true)
+			end
+		end
+
+		-- Clean up source if no more asm buffers
+		if require("godbolt").config.auto_cleanup and vim.tbl_isempty(map[source_buffer]) then
+			remove_source(source_buffer)
+			map[source_buffer] = nil
+		end
 	end
+
+	-- Clean up buffer highlights if buffer still exists
+	if api.nvim_buf_is_valid(asm_buffer) then
+		api.nvim_buf_clear_namespace(asm_buffer, nsid_static, 0, -1)
+		api.nvim_buf_clear_namespace(asm_buffer, nsid, 0, -1)
+	end
+
+	return nil
 end
 local function setup_aucmd(source_buf, asm_buf)
 	local group = api.nvim_create_augroup("Godbolt", { clear = false })
 	local cursor = set_highlight_group("GodboltCursor", get_highlight("cursor"))
+
 	if 0 == #api.nvim_get_autocmds({ group = group, buffer = source_buf }) then
 		if cursor then
 			local function _22_()
@@ -216,25 +270,47 @@ local function setup_aucmd(source_buf, asm_buf)
 				{ "CursorMoved", "BufEnter" },
 				{ group = group, callback = _22_, buffer = source_buf }
 			)
-		else
 		end
+
 		local function _24_()
 			return remove_source(source_buf)
 		end
-		api.nvim_create_autocmd({ "BufUnload" }, { group = group, callback = _24_, buffer = source_buf })
-	else
+		api.nvim_create_autocmd(
+			{ "BufUnload", "BufDelete", "BufWipeout" },
+			{ group = group, callback = _24_, buffer = source_buf }
+		)
 	end
+
 	if cursor then
 		local function _26_()
 			return update_asm(source_buf, asm_buf)
 		end
 		api.nvim_create_autocmd({ "CursorMoved", "BufEnter" }, { group = group, callback = _26_, buffer = asm_buf })
-	else
 	end
+
 	local function _28_()
 		return clear_asm(source_buf, asm_buf)
 	end
-	return api.nvim_create_autocmd({ "BufUnload" }, { group = group, callback = _28_, buffer = asm_buf })
+
+	-- Set up window close detection for assembly buffer
+	local function on_win_closed()
+		if map[source_buf] and map[source_buf][asm_buf] then
+			-- Just call clear_asm which will handle all cleanup
+			clear_asm(source_buf, asm_buf)
+		end
+	end
+
+	api.nvim_create_autocmd(
+		{ "BufUnload", "BufDelete", "BufWipeout", "WinClosed" },
+		{ group = group, callback = _28_, buffer = asm_buf }
+	)
+
+	-- Add WinClosed handler specifically for the assembly window
+	api.nvim_create_autocmd({ "WinClosed" }, {
+		group = group,
+		callback = on_win_closed,
+		buffer = asm_buf,
+	})
 end
 local function make_qflist(err, bufnr)
 	if next(err) then
